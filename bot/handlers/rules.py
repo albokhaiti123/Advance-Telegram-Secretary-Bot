@@ -1,7 +1,12 @@
 import math
 from aiogram import F, Router
 from aiogram.fsm.context import FSMContext
-from aiogram.types import CallbackQuery, Message
+from aiogram.types import (
+    CallbackQuery,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    Message,
+)
 from sqlalchemy import func, select
 from sqlalchemy.orm import selectinload
 
@@ -12,7 +17,11 @@ from bot.keyboards.builders import (
     build_trigger_types_keyboard,
 )
 from bot.keyboards.main_menu import get_section_submenu_keyboard
-from bot.keyboards.navigation import build_cancel_keyboard, build_confirm_cancel_keyboard
+from bot.keyboards.navigation import (
+    build_back_and_home_row,
+    build_cancel_keyboard,
+    build_confirm_cancel_keyboard,
+)
 from bot.states.admin_states import RuleWizardStates
 from database.database import DatabaseManager
 from database.models import AutoReplyRule, ReplyTemplate
@@ -58,12 +67,95 @@ async def cb_list_rules(
     await callback.answer()
 
 
+@rules_router.callback_query(F.data == "rules:priorities")
+async def cb_rules_priorities_panel(
+    callback: CallbackQuery,
+    db_manager: DatabaseManager,
+) -> None:
+    """شاشة تفاعلية سريعة لترتيب أولويات جميع القواعد في مكان واحد."""
+    async with db_manager.session() as session:
+        stmt = (
+            select(AutoReplyRule)
+            .order_by(AutoReplyRule.priority.desc(), AutoReplyRule.id.asc())
+            .limit(15)
+        )
+        rules = list((await session.scalars(stmt)).all())
+
+    rows = []
+    lines = []
+    for idx, r in enumerate(rules, start=1):
+        badge = "🟢" if r.is_active else "🔴"
+        lines.append(
+            f"{idx}. {badge} <b>{r.name}</b> — الأولوية: <code>{r.priority}</code> ({r.trigger_type})"
+        )
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    text="⬆️ +10",
+                    callback_data=f"rules:p_quick:up:{r.id}",
+                ),
+                InlineKeyboardButton(
+                    text=f"[{r.priority}] {r.name[:18]}",
+                    callback_data=f"rules:view:{r.id}",
+                ),
+                InlineKeyboardButton(
+                    text="⬇️ -10",
+                    callback_data=f"rules:p_quick:down:{r.id}",
+                ),
+            ]
+        )
+
+    rows.append(build_back_and_home_row("sec:rules"))
+    body = "\n".join(lines) if lines else "لا توجد قواعد مضافة بعد."
+    text = (
+        "🔢 <b>ترتيب أولويات القواعد</b>\n"
+        "━━━━━━━━━━━━━━━━━━━━\n"
+        "يتم فحص القواعد من الأعلى أولوية إلى الأقل. استخدم أزرار (⬆️ +10) و(⬇️ -10) لإعادة الترتيب الفوري:\n\n"
+        f"{body}"
+    )
+
+    if callback.message:
+        await callback.message.edit_text(
+            text=text,
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
+            parse_mode="HTML",
+        )
+    await callback.answer()
+
+
+@rules_router.callback_query(F.data.startswith("rules:p_quick:"))
+async def cb_quick_adjust_priority(
+    callback: CallbackQuery,
+    db_manager: DatabaseManager,
+    access_control: AccessControl,
+) -> None:
+    """تعديل سريع لأولوية القاعدة من داخل شاشة ترتيب الأولويات."""
+    parts = (callback.data or "").split(":")
+    direction, rule_id = parts[2], int(parts[3])
+    delta = 10 if direction == "up" else -10
+
+    async with db_manager.session() as session:
+        rule = await session.get(AutoReplyRule, rule_id)
+        if not rule:
+            await callback.answer("القاعدة غير موجودة", show_alert=True)
+            return
+        rule.priority = max(1, (rule.priority or 100) + delta)
+        new_prio = rule.priority
+
+    await access_control.log_admin_action(
+        "change_rule_priority",
+        target_id=str(rule_id),
+        details={"new_priority": new_prio},
+    )
+    await callback.answer(f"تم تحديث الأولوية إلى {new_prio} ✅")
+    await cb_rules_priorities_panel(callback, db_manager)
+
+
 @rules_router.callback_query(F.data.startswith("rules:view:"))
 async def cb_view_rule(
     callback: CallbackQuery,
     db_manager: DatabaseManager,
 ) -> None:
-    """عرض تفاصيل قاعدة محددة مع إحصائيات تنفيذها."""
     rule_id = int((callback.data or "").split(":")[-1])
     async with db_manager.session() as session:
         stmt = (
@@ -111,7 +203,6 @@ async def cb_toggle_rule(
     db_manager: DatabaseManager,
     access_control: AccessControl,
 ) -> None:
-    """تفعيل أو تعطيل قاعدة محددة."""
     rule_id = int((callback.data or "").split(":")[-1])
     async with db_manager.session() as session:
         rule = await session.get(AutoReplyRule, rule_id)
@@ -132,7 +223,6 @@ async def cb_change_rule_priority(
     callback: CallbackQuery,
     db_manager: DatabaseManager,
 ) -> None:
-    """رفع أو خفض أولوية القاعدة."""
     parts = (callback.data or "").split(":")
     action, rule_id = parts[1], int(parts[2])
     delta = 10 if action == "prio_up" else -10
@@ -151,7 +241,6 @@ async def cb_clone_rule(
     db_manager: DatabaseManager,
     access_control: AccessControl,
 ) -> None:
-    """نسخ قاعدة موجودة."""
     rule_id = int((callback.data or "").split(":")[-1])
     async with db_manager.session() as session:
         orig = await session.get(AutoReplyRule, rule_id)
@@ -159,7 +248,7 @@ async def cb_clone_rule(
             await callback.answer("القاعدة غير موجودة", show_alert=True)
             return
         cloned = AutoReplyRule(
-            name=f"{orig.name} (نسخة)",
+            name=f"{orig.name} ({orig.id}-نسخة)",
             trigger_type=orig.trigger_type,
             trigger_value=orig.trigger_value,
             template_id=orig.template_id,
@@ -214,7 +303,6 @@ async def cb_confirm_delete_rule(
     await cb_list_rules(callback, db_manager)
 
 
-# --- معالج إضافة قاعدة جديدة (Wizard) ---
 @rules_router.callback_query(F.data == "rules:add")
 async def cb_add_rule_start(callback: CallbackQuery, state: FSMContext) -> None:
     await state.set_state(RuleWizardStates.waiting_for_name)
@@ -360,7 +448,6 @@ async def cb_rule_pick_template(
     await cb_list_rules(callback, db_manager)
 
 
-# --- اختبار مطابقة القواعد من لوحة التحكم ---
 @rules_router.callback_query(F.data == "rules:test")
 async def cb_test_rules_prompt(callback: CallbackQuery, state: FSMContext) -> None:
     await state.set_state(RuleWizardStates.waiting_for_test_input)

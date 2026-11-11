@@ -223,6 +223,12 @@ platform win32 -- Python 3.11.2, pytest-9.1.1, asyncio-1.4.1
 | `services/group_manager.py` | فرع `specific_group_ids` لا يحفظ ترتيب الإدراج | استخدام dict map للحفاظ على الترتيب الأصلي |
 | `services/broadcast_manager.py` | استعلام المستلمين بدون `ORDER BY id ASC` | إضافة `.order_by(BroadcastRecipient.id.asc())` |
 | `tests/test_phases_14_to_18_complete.py` | FK constraint: `BroadcastDeliveryLog` قبل flush | إضافة `await session.flush()` بعد إضافة `BroadcastRun` |
+| `bot/middlewares/error_handler.py` | توقف المعالجة عند عدم تعديل الرسالة أو بطء الشبكة | تجاهل "message is not modified" ومعالجة `TelegramNetworkError` بلطف |
+| `integrations/personal/authorization.py` | خطأ `ApiIdInvalidError` ووجود قيم افتراضية غير صالحة | فحص القيم الافتراضية، معالجة `ApiIdInvalidError` وتنظيف الرمز |
+| `services/response_replacement.py` | جدولة إعادة حذف حتى لو كانت الصلاحيات تمنع الحذف نهائيًا | فحص `is_retryable` قبل جدولة مهمة `retry_delete` |
+| `scheduler/manager.py` | عدم التقاط المهام المستجدة المجدولة في DB بعد الإقلاع | إضافة فحص دوري كل 30 ثانية للمهام المستحقة (`poll_due_pending_tasks`) |
+| `bot/handlers/templates.py` | نقص معالجات إدارة الأزرار ومكتبة الوسائط | تفعيل واجهة إدارة الأزرار الكاملة (`tpl:buttons`) ومكتبة الوسائط (`tpl:media`) |
+| `bot/handlers/rules.py` | عدم استجابة زر «🔢 ترتيب الأولويات» التفاعلي | إضافة شاشة `rules:priorities` وتعديل الأولويات السريع (`rules:p_quick:`) |
 
 ---
 

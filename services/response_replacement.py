@@ -30,10 +30,7 @@ class ReplacementExecutionResult:
 
 
 class ResponseReplacementManager:
-    """
-    المدير المسؤول عن إرسال الرد التلقائي الجديد ثم حذف الرد التلقائي السابق بأمان
-    مع قفل مستقل لكل محادثة واستعادة الحالة بعد إعادة التشغيل.
-    """
+    """إرسال الرد التلقائي الجديد ثم حذف الرد التلقائي السابق بأمان مع قفل مستقل لكل محادثة."""
 
     def __init__(
         self,
@@ -48,7 +45,6 @@ class ResponseReplacementManager:
         self._registry_lock = asyncio.Lock()
 
     async def get_chat_lock(self, chat_id: int) -> asyncio.Lock:
-        """الحصول على قفل مستقل خاص بالمحادثة المحددة."""
         async with self._registry_lock:
             if chat_id not in self._chat_locks:
                 self._chat_locks[chat_id] = asyncio.Lock()
@@ -62,18 +58,10 @@ class ResponseReplacementManager:
         rule_id: Optional[int] = None,
         auto_delete_seconds: Optional[int] = None,
     ) -> ReplacementExecutionResult:
-        """
-        تنفيذ دورة الاستبدال الذرية داخل قفل المحادثة:
-        1. إرسال الرد الجديد أولًا.
-        2. إذا نجح، حذف آخر رد تلقائي سابق مسجل في managed_responses لهذه المحادثة.
-        3. تحديث السجلات وحفظ الحالة.
-        """
         chat_lock = await self.get_chat_lock(chat_id)
 
         async with chat_lock:
             now = datetime.now(timezone.utc)
-
-            # 1. جلب آخر رد تلقائي سابق وتسجيل عملية معلقة قبل الإرسال
             previous_managed_id: Optional[int] = None
             previous_tg_msg_id: Optional[int] = None
 
@@ -103,7 +91,6 @@ class ResponseReplacementManager:
                         "started_at": now.isoformat(),
                     }
 
-            # 2. إرسال الرد الجديد أولًا
             send_result = await self.business_sender.send_reply(
                 business_connection_id=business_connection_id,
                 chat_id=chat_id,
@@ -115,7 +102,6 @@ class ResponseReplacementManager:
                 disable_web_page_preview=payload.disable_web_page_preview,
             )
 
-            # 3. إذا فشل إرسال الرد الجديد: لا نحذف الرد القديم أبدًا وننظف العملية المعلقة
             if not send_result.success or send_result.message_id is None:
                 async with self.db_manager.session() as session:
                     conv_state = await session.scalar(
@@ -124,11 +110,6 @@ class ResponseReplacementManager:
                     if conv_state:
                         conv_state.pending_operation_json = None
 
-                logger.warning(
-                    "فشل إرسال الرد الجديد في المحادثة %s؛ تم الإبقاء على الرد السابق (%s) دون تغيير.",
-                    chat_id,
-                    previous_tg_msg_id,
-                )
                 return ReplacementExecutionResult(
                     success=False,
                     error_message=send_result.error_message,
@@ -136,16 +117,16 @@ class ResponseReplacementManager:
 
             new_msg_id = send_result.message_id
             old_delete_ok = True
+            old_delete_retryable = False
 
-            # 4. بعد نجاح إرسال الرد الجديد: نحذف الرد التلقائي السابق إن وجد
             if previous_tg_msg_id is not None and previous_managed_id is not None:
                 del_result = await self.business_sender.delete_managed_messages(
                     business_connection_id=business_connection_id,
                     message_ids=[previous_tg_msg_id],
                 )
                 old_delete_ok = del_result.success
+                old_delete_retryable = del_result.is_retryable
 
-            # 5. تحديث قاعدة البيانات: تسجيل الرد الجديد وتحديث حالة الرد القديم
             finish_now = datetime.now(timezone.utc)
             scheduled_del_at = (
                 finish_now + timedelta(seconds=auto_delete_seconds)
@@ -176,27 +157,26 @@ class ResponseReplacementManager:
                         else:
                             old_rec.status = "delete_failed"
                             old_rec.delete_retry_count = (old_rec.delete_retry_count or 0) + 1
-                            # جدولة مهمة إعادة محاولة حذف الرد القديم
-                            retry_task_id = f"retry_del_{old_rec.id}_{uuid.uuid4().hex[:6]}"
-                            session.add(
-                                ScheduledTask(
-                                    task_id=retry_task_id,
-                                    task_type="retry_delete",
-                                    reference_id=str(old_rec.id),
-                                    payload_json={
-                                        "managed_response_id": old_rec.id,
-                                        "chat_id": chat_id,
-                                        "message_id": previous_tg_msg_id,
-                                        "business_connection_id": business_connection_id,
-                                    },
-                                    run_at=finish_now + timedelta(seconds=30),
-                                    status="pending",
-                                    max_retries=self.max_delete_retries,
-                                    last_error="Failed initial deletion during replacement",
+                            if old_delete_retryable:
+                                retry_task_id = f"retry_del_{old_rec.id}_{uuid.uuid4().hex[:6]}"
+                                session.add(
+                                    ScheduledTask(
+                                        task_id=retry_task_id,
+                                        task_type="retry_delete",
+                                        reference_id=str(old_rec.id),
+                                        payload_json={
+                                            "managed_response_id": old_rec.id,
+                                            "chat_id": chat_id,
+                                            "message_id": previous_tg_msg_id,
+                                            "business_connection_id": business_connection_id,
+                                        },
+                                        run_at=finish_now + timedelta(seconds=30),
+                                        status="pending",
+                                        max_retries=self.max_delete_retries,
+                                        last_error="Failed initial deletion during replacement",
+                                    )
                                 )
-                            )
 
-                # إضافة الرد التلقائي الجديد كآخر رد في المحادثة
                 new_managed = ManagedResponse(
                     chat_id=chat_id,
                     message_id=new_msg_id,
@@ -210,7 +190,6 @@ class ResponseReplacementManager:
                 session.add(new_managed)
                 await session.flush()
 
-                # إذا كان للقاعدة مدة حذف تلقائي، نجدول مهمة حذف مستقبلية
                 if scheduled_del_at is not None:
                     session.add(
                         ScheduledTask(
@@ -229,7 +208,6 @@ class ResponseReplacementManager:
                         )
                     )
 
-                # تحديث عداد الردود وإزالة العملية المعلقة
                 conv = await session.get(Conversation, chat_id)
                 if conv:
                     conv.reply_count = (conv.reply_count or 0) + 1
@@ -249,7 +227,6 @@ class ResponseReplacementManager:
             )
 
     async def retry_failed_deletion(self, managed_response_id: int) -> bool:
-        """إعادة محاولة حذف رد سابق فشل حذفه سابقًا."""
         async with self.db_manager.session() as session:
             rec = await session.get(ManagedResponse, managed_response_id)
             if not rec or rec.status == "deleted" or not rec.business_connection_id:

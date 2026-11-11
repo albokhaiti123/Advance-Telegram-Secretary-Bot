@@ -6,10 +6,10 @@ from zoneinfo import ZoneInfo
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
 from apscheduler.triggers.date import DateTrigger
-from sqlalchemy import select, update
+from sqlalchemy import select
 
 from database.database import DatabaseManager
-from database.models import ManagedResponse, ScheduledTask
+from database.models import ScheduledTask
 from integrations.business.sender import BusinessSender
 from services.broadcast_manager import BroadcastManager
 from services.campaign_manager import CampaignManager
@@ -19,12 +19,7 @@ logger = logging.getLogger("secretary_bot.scheduler")
 
 
 class UnifiedSchedulerManager:
-    """
-    مدير المهام المجدولة الموحد:
-    - يخزن جميع المهام في جدول scheduled_tasks.
-    - يمنع تكرار المهمة نفسها ويلغي المهام القديمة عند استبدالها.
-    - ينفذ الحذف المؤجل للردود، إعادة محاولة الحذف، والحملات المجدولة والمتكررة.
-    """
+    """مدير المهام المجدولة الموحد مع التقاط دوري للمهام المستجدة في قاعدة البيانات."""
 
     def __init__(
         self,
@@ -52,10 +47,36 @@ class UnifiedSchedulerManager:
     def start(self) -> None:
         if not self.scheduler.running:
             self.scheduler.start()
+            self.scheduler.add_job(
+                self.poll_due_pending_tasks,
+                trigger="interval",
+                seconds=30,
+                id="internal_poll_due_tasks",
+                replace_existing=True,
+            )
 
     def shutdown(self) -> None:
         if self.scheduler.running:
             self.scheduler.shutdown(wait=False)
+
+    async def poll_due_pending_tasks(self) -> None:
+        """التقاط وتنفيذ أي مهام مجدولة في قاعدة البيانات حان وقت تنفيذها."""
+        now = datetime.now(timezone.utc)
+        async with self.db_manager.session() as session:
+            due_tasks = list(
+                (
+                    await session.scalars(
+                        select(ScheduledTask).where(
+                            ScheduledTask.status == "pending",
+                            ScheduledTask.cron_expression.is_(None),
+                            ScheduledTask.run_at.is_not(None),
+                            ScheduledTask.run_at <= now,
+                        )
+                    )
+                ).all()
+            )
+        for task in due_tasks:
+            await self.execute_scheduled_task(task.task_id)
 
     async def schedule_campaign_task(
         self,
@@ -63,7 +84,6 @@ class UnifiedSchedulerManager:
         run_at: Optional[datetime] = None,
         cron_expression: Optional[str] = None,
     ) -> ScheduledTask:
-        """جدولة حملة لمرة واحدة أو متكررة مع إلغاء أي جدولة سابقة لنفس الحملة."""
         now = datetime.now(timezone.utc)
         task_id = f"camp_sched_{campaign_id}_{uuid.uuid4().hex[:8]}"
 
@@ -104,7 +124,6 @@ class UnifiedSchedulerManager:
         return task
 
     def _register_apscheduler_job(self, task: ScheduledTask) -> None:
-        """تسجيل المهمة فعليًا في APScheduler."""
         if self.scheduler.get_job(task.task_id):
             self.scheduler.remove_job(task.task_id)
 
@@ -123,7 +142,6 @@ class UnifiedSchedulerManager:
         )
 
     async def execute_scheduled_task(self, task_id: str) -> bool:
-        """تنفيذ المهمة المجدولة عند حلول موعدها مع التحقق من عدم إلغائها أو إبطالها."""
         now = datetime.now(timezone.utc)
         async with self.db_manager.session() as session:
             task = await session.get(ScheduledTask, task_id)

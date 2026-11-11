@@ -2,9 +2,10 @@ import logging
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Optional
-from sqlalchemy import delete, select
+from sqlalchemy import delete
 from telethon import TelegramClient
 from telethon.errors import (
+    ApiIdInvalidError,
     PasswordHashInvalidError,
     PhoneCodeExpiredError,
     PhoneCodeInvalidError,
@@ -30,10 +31,7 @@ class AuthStepResult:
 
 
 class PersonalAuthService:
-    """
-    إدارة عملية تسجيل الدخول التفاعلية للحساب الشخصي (هاتف ⟵ رمز تحقق ⟵ تحقق بخطوتين 2FA)
-    مع تشفير الجلسة بـ Fernet فور نجاح التفويض وعدم كتابة أي رمز سري في السجلات.
-    """
+    """إدارة عملية تسجيل الدخول التفاعلية للحساب الشخصي وتشفير الجلسة بـ Fernet."""
 
     def __init__(
         self,
@@ -58,12 +56,23 @@ class PersonalAuthService:
         await self._cleanup_temp_client()
         cleaned_phone = phone_number.strip().replace(" ", "")
 
+        if int(self.api_id) == 12345678 or "0123456789abcdef" in self.api_hash.lower():
+            return AuthStepResult(
+                status="error",
+                message=(
+                    "قيم TG_API_ID و TG_API_HASH في ملف .env ما زالت القيم التجريبية.\n"
+                    "تم تحديث ملف .env تلقائيًا، يرجى إعادة تشغيل البوت والمحاولة مجددًا."
+                ),
+            )
+
         try:
             self._temp_client = TelegramClient(
                 StringSession(),
-                self.api_id,
-                self.api_hash,
+                int(self.api_id),
+                self.api_hash.strip().strip('"').strip("'"),
                 device_model="SecretaryBot Ubuntu VPS",
+                system_version="Linux 6.8",
+                app_version="1.0.0",
             )
             await self._temp_client.connect()
             sent = await self._temp_client.send_code_request(cleaned_phone)
@@ -76,6 +85,12 @@ class PersonalAuthService:
                 message=f"تم إرسال رمز التحقق إلى الرقم {masked}.",
                 phone_masked=masked,
             )
+        except ApiIdInvalidError:
+            await self._cleanup_temp_client()
+            return AuthStepResult(
+                status="error",
+                message="خطأ ApiIdInvalidError: تأكد من صحة TG_API_ID و TG_API_HASH في ملف .env.",
+            )
         except Exception as exc:
             await self._cleanup_temp_client()
             return AuthStepResult(
@@ -84,14 +99,13 @@ class PersonalAuthService:
             )
 
     async def submit_code(self, raw_code: str) -> AuthStepResult:
-        """الخطوة 2: التحقق من الرمز المرسل (مع دعم طلب كلمة مرور 2FA عند تفعيلها)."""
+        """الخطوة 2: التحقق من الرمز المرسل."""
         if not self._temp_client or not self._pending_phone or not self._phone_code_hash:
             return AuthStepResult(
                 status="error",
                 message="لا توجد جلسة تفويض جارية؛ يرجى البدء بإرسال رقم الهاتف مجددًا.",
             )
 
-        # السماح للمالك بإدخال الكود مفصولًا بمسافات أو شرطات لمنع حظر تيليجرام للكود
         clean_code = "".join(ch for ch in raw_code if ch.isdigit())
 
         try:
@@ -115,7 +129,7 @@ class PersonalAuthService:
             await self._cleanup_temp_client()
             return AuthStepResult(
                 status="error",
-                message="انتهت صلاحية رمز التحقق. يرجى إعادة بدء عملية الربط.",
+                message="انتهت صلاحية رمز التحقق. يرجى إعادة بدء عملية الربط وإرسال الرمز مفصولًا بمسافات.",
             )
         except Exception as exc:
             await self._cleanup_temp_client()
@@ -147,7 +161,6 @@ class PersonalAuthService:
             )
 
     async def _finalize_authorized_session(self, tg_user: object) -> AuthStepResult:
-        """تشفير نص الجلسة وحفظه في قاعدة البيانات وإغلاق العميل المؤقت."""
         assert self._temp_client is not None
         assert self._pending_phone is not None
 
@@ -161,7 +174,6 @@ class PersonalAuthService:
         await self._cleanup_temp_client()
 
         async with self.db_manager.session() as session:
-            # حذف أي جلسات قديمة لضمان جلسة حساب شخصي واحدة فقط
             await session.execute(delete(PersonalAccountSession))
             session.add(
                 PersonalAccountSession(
