@@ -81,4 +81,5 @@ def setup_logging(
     root_logger.addHandler(file_handler)
     root_logger.addHandler(console_handler)
 
+    logging.getLogger("telethon").setLevel(logging.ERROR)
     return root_logger

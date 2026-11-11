@@ -1,3 +1,4 @@
+import math
 from aiogram import F, Router
 from aiogram.fsm.context import FSMContext
 from aiogram.types import (
@@ -6,6 +7,7 @@ from aiogram.types import (
     InlineKeyboardMarkup,
     Message,
 )
+from sqlalchemy import func, select
 
 from bot.keyboards.main_menu import get_section_submenu_keyboard
 from bot.keyboards.navigation import (
@@ -14,6 +16,12 @@ from bot.keyboards.navigation import (
     build_pagination_row,
 )
 from bot.states.admin_states import ExceptionWizardStates
+from database.database import DatabaseManager
+from database.models import (
+    IgnoredConversation,
+    IgnoredUser,
+    ManagedResponse,
+)
 from services.conversation_manager import ConversationManager
 
 conversations_router = Router(name="conversations_router")
@@ -48,6 +56,67 @@ async def cb_list_conversations(
     if callback.message:
         await callback.message.edit_text(
             text=f"💬 <b>المحادثات المسجلة ({total})</b>\nاختر محادثة للتحكم بها أو مراجعة آخر رد تلقائي:",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
+            parse_mode="HTML",
+        )
+    await callback.answer()
+
+
+@conversations_router.callback_query(F.data.startswith("conv:managed"))
+async def cb_list_managed_responses(
+    callback: CallbackQuery,
+    db_manager: DatabaseManager,
+) -> None:
+    """عرض سجل الردود التلقائية الأخيرة التي أرسلها النظام وحالة استبدالها."""
+    parts = (callback.data or "conv:managed:1").split(":")
+    page = int(parts[-1]) if parts[-1].isdigit() else 1
+    page_size = 10
+
+    async with db_manager.session() as session:
+        total = (
+            await session.scalar(select(func.count()).select_from(ManagedResponse))
+            or 0
+        )
+        total_pages = max(1, math.ceil(total / page_size))
+        stmt = (
+            select(ManagedResponse)
+            .order_by(ManagedResponse.id.desc())
+            .offset((page - 1) * page_size)
+            .limit(page_size)
+        )
+        items = list((await session.scalars(stmt)).all())
+
+    status_badges = {
+        "active": "🟢 نشط (الأخير)",
+        "replaced": "🔄 تم استبداله وحذفه",
+        "deleted": "🗑️ محذوف",
+        "delete_failed": "⚠️ تعذر حذفه (نقص صلاحية)",
+    }
+
+    lines = []
+    for r in items:
+        st_label = status_badges.get(r.status, r.status)
+        ts = r.sent_at.strftime("%m-%d %H:%M") if r.sent_at else "—"
+        lines.append(
+            f"• <code>[{ts}]</code> محادثة <code>{r.chat_id}</code> | رسالة <code>#{r.message_id}</code> ⬅️ {st_label}"
+        )
+
+    body = "\n".join(lines) if lines else "لا توجد ردود تلقائية مرسلة حتى الآن."
+    text = (
+        f"🔄 <b>سجل الردود التلقائية الأخيرة ({total})</b>\n"
+        "━━━━━━━━━━━━━━━━━━━━\n"
+        f"{body}"
+    )
+
+    rows = []
+    pag = build_pagination_row("conv:managed", page, total_pages)
+    if pag:
+        rows.append(pag)
+    rows.append(build_back_and_home_row("sec:conversations"))
+
+    if callback.message:
+        await callback.message.edit_text(
+            text=text,
             reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
             parse_mode="HTML",
         )
@@ -178,7 +247,116 @@ async def cb_clear_pending_ops(
     )
 
 
-# --- معالجات الاستثناءات ---
+# =========================================================
+# معالجات قسم الاستثناءات (قوائم الحظر والسماح)
+# =========================================================
+@conversations_router.callback_query(F.data.startswith("exc:users_"))
+async def cb_list_user_exceptions(
+    callback: CallbackQuery,
+    db_manager: DatabaseManager,
+) -> None:
+    data_str = callback.data or "exc:users_black:1"
+    list_type = "blacklist" if "users_black" in data_str else "whitelist"
+    title = "🚫 قائمة حظر المستخدمين (Blacklist)" if list_type == "blacklist" else "✅ قائمة سماح المستخدمين (Whitelist)"
+
+    async with db_manager.session() as session:
+        users = list(
+            (
+                await session.scalars(
+                    select(IgnoredUser).where(IgnoredUser.list_type == list_type)
+                )
+            ).all()
+        )
+
+    rows = []
+    for u in users:
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    text=f"🗑️ إزالة المستخدم {u.user_id} ({u.reason or 'بدون سبب'})",
+                    callback_data=f"exc:del_user:{u.user_id}",
+                )
+            ]
+        )
+    rows.append([InlineKeyboardButton(text="➕ إضافة استثناء جديد", callback_data="exc:add")])
+    rows.append(build_back_and_home_row("sec:exceptions"))
+
+    body = (
+        f"إجمالي المستخدمين في القائمة: <b>{len(users)}</b>\nاضغط على أي مستخدم لإزالته من القائمة:"
+        if users
+        else "القائمة فارغة حاليًا."
+    )
+    if callback.message:
+        await callback.message.edit_text(
+            text=f"<b>{title}</b>\n━━━━━━━━━━━━━━━━━━━━\n{body}",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
+            parse_mode="HTML",
+        )
+    await callback.answer()
+
+
+@conversations_router.callback_query(F.data.startswith("exc:chats_black"))
+async def cb_list_chat_exceptions(
+    callback: CallbackQuery,
+    db_manager: DatabaseManager,
+) -> None:
+    async with db_manager.session() as session:
+        chats = list(
+            (
+                await session.scalars(select(IgnoredConversation))
+            ).all()
+        )
+
+    rows = []
+    for c in chats:
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    text=f"🗑️ إزالة المحادثة {c.title or c.chat_id}",
+                    callback_data=f"exc:del_chat:{c.chat_id}",
+                )
+            ]
+        )
+    rows.append(build_back_and_home_row("sec:exceptions"))
+
+    body = (
+        f"إجمالي المحادثات المستثناة: <b>{len(chats)}</b>\nاضغط على أي محادثة لإلغاء استثنائها:"
+        if chats
+        else "لا توجد محادثات مستثناة حاليًا."
+    )
+    if callback.message:
+        await callback.message.edit_text(
+            text=f"🔇 <b>المحادثات المستثناة</b>\n━━━━━━━━━━━━━━━━━━━━\n{body}",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
+            parse_mode="HTML",
+        )
+    await callback.answer()
+
+
+@conversations_router.callback_query(F.data.startswith("exc:del_user:"))
+async def cb_delete_user_exception(
+    callback: CallbackQuery,
+    conversation_manager: ConversationManager,
+    db_manager: DatabaseManager,
+) -> None:
+    uid = int((callback.data or "").split(":")[-1])
+    await conversation_manager.remove_user_exception(uid)
+    await callback.answer("تمت إزالة المستخدم من الاستثناءات ✅")
+    await cb_list_user_exceptions(callback, db_manager)
+
+
+@conversations_router.callback_query(F.data.startswith("exc:del_chat:"))
+async def cb_delete_chat_exception(
+    callback: CallbackQuery,
+    conversation_manager: ConversationManager,
+    db_manager: DatabaseManager,
+) -> None:
+    cid = int((callback.data or "").split(":")[-1])
+    await conversation_manager.remove_chat_exception(cid)
+    await callback.answer("تمت إزالة المحادثة من الاستثناءات ✅")
+    await cb_list_chat_exceptions(callback, db_manager)
+
+
 @conversations_router.callback_query(F.data == "exc:add")
 async def cb_add_exception_prompt(callback: CallbackQuery, state: FSMContext) -> None:
     await state.set_state(ExceptionWizardStates.waiting_for_user_id)

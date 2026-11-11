@@ -283,12 +283,13 @@ class StatisticsService:
             stmt = stmt.order_by(ActivityLog.id.desc()).limit(limit)
             return list((await session.scalars(stmt)).all())
 
-    async def list_system_errors(self, limit: int = 10) -> List[SystemError]:
+    async def list_system_errors(
+        self, limit: int = 10, unresolved_only: bool = True
+    ) -> List[SystemError]:
         """جلب آخر أخطاء النظام لعرضها في لوحة التحكم."""
         async with self.db_manager.session() as session:
-            stmt = (
-                select(SystemError)
-                .order_by(SystemError.id.desc())
-                .limit(limit)
-            )
+            stmt = select(SystemError)
+            if unresolved_only:
+                stmt = stmt.where(SystemError.resolved.is_(False))
+            stmt = stmt.order_by(SystemError.id.desc()).limit(limit)
             return list((await session.scalars(stmt)).all())

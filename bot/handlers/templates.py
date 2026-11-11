@@ -584,7 +584,7 @@ async def msg_button_url_received(
             [
                 InlineKeyboardButton(
                     text="👁️ معاينة القالب الآن",
-                    callback_data=f"tpl:preview:{tpl.id}",
+                    callback_data=f"tpl:preview:{tpl_id}",
                 )
             ],
             build_back_and_home_row("sec:templates"),

@@ -1,7 +1,11 @@
 from aiogram import F, Router
-from aiogram.types import CallbackQuery
+from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup
+from sqlalchemy import delete
 
 from bot.keyboards.main_menu import get_section_submenu_keyboard
+from bot.keyboards.navigation import build_back_and_home_row
+from database.database import DatabaseManager
+from database.models import SystemError
 from services.statistics import StatisticsService
 from utils.formatting import (
     format_activity_logs_list,
@@ -66,7 +70,6 @@ async def cb_stats_campaigns(
     await callback.answer()
 
 
-# --- معالجات القسم 10: سجل النشاط والأخطاء ---
 @statistics_router.callback_query(F.data.startswith("logs:errors"))
 async def cb_logs_errors(
     callback: CallbackQuery,
@@ -74,13 +77,32 @@ async def cb_logs_errors(
 ) -> None:
     errors = await statistics_service.list_system_errors(limit=10)
     text = format_system_errors_list(errors)
+    kb = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="🧹 مسح وتصفير سجل الأخطاء",
+                    callback_data="logs:clear_errors",
+                )
+            ],
+            build_back_and_home_row("sec:logs"),
+        ]
+    )
     if callback.message:
-        await callback.message.edit_text(
-            text=text,
-            reply_markup=get_section_submenu_keyboard("logs"),
-            parse_mode="HTML",
-        )
+        await callback.message.edit_text(text=text, reply_markup=kb, parse_mode="HTML")
     await callback.answer()
+
+
+@statistics_router.callback_query(F.data == "logs:clear_errors")
+async def cb_clear_all_errors(
+    callback: CallbackQuery,
+    db_manager: DatabaseManager,
+    statistics_service: StatisticsService,
+) -> None:
+    async with db_manager.session() as session:
+        await session.execute(delete(SystemError))
+    await callback.answer("تم مسح سجل الأخطاء وتصفير العداد بنجاح ✅", show_alert=True)
+    await cb_logs_errors(callback, statistics_service)
 
 
 @statistics_router.callback_query(F.data.startswith("logs:admin"))
