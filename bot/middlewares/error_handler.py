@@ -2,7 +2,11 @@ import logging
 import traceback
 from typing import Any, Awaitable, Callable, Dict
 from aiogram import BaseMiddleware
-from aiogram.exceptions import TelegramBadRequest, TelegramNetworkError
+from aiogram.exceptions import (
+    TelegramBadRequest,
+    TelegramNetworkError,
+    TelegramServerError,
+)
 from aiogram.types import CallbackQuery, Message, TelegramObject
 from database.database import DatabaseManager
 from database.models import SystemError
@@ -11,7 +15,14 @@ logger = logging.getLogger("secretary_bot.errors")
 
 
 class ErrorHandlerMiddleware(BaseMiddleware):
-    """التقاط الاستثناءات، وتجاهل خطأ عدم تغير النص، والتعامل السليم مع انقطاعات الشبكة."""
+    """التقاط الاستثناءات، وتجاهل الأخطاء الشكلية (عدم تغير النص أو انتهاء مهلة الضغطة)، ومعالجة الشبكة."""
+
+    IGNORED_BAD_REQUEST_PHRASES = (
+        "message is not modified",
+        "query is too old",
+        "query id is invalid",
+        "message to edit not found",
+    )
 
     def __init__(self, db_manager: DatabaseManager) -> None:
         super().__init__()
@@ -27,8 +38,9 @@ class ErrorHandlerMiddleware(BaseMiddleware):
             return await handler(event, data)
 
         except TelegramBadRequest as exc:
-            if "message is not modified" in str(exc).lower():
-                if isinstance(event, CallbackQuery):
+            err_lower = str(exc).lower()
+            if any(phrase in err_lower for phrase in self.IGNORED_BAD_REQUEST_PHRASES):
+                if isinstance(event, CallbackQuery) and "message is not modified" in err_lower:
                     try:
                         await event.answer("البيانات محدثة بالفعل ✅")
                     except Exception:
@@ -39,12 +51,12 @@ class ErrorHandlerMiddleware(BaseMiddleware):
             await self._notify_user_on_error(event, "⚠️ تعذر تنفيذ الطلب في تيليجرام.")
             return None
 
-        except TelegramNetworkError as exc:
-            logger.warning("بطء أو انقطاع شبكة مؤقت مع خوادم تيليجرام: %s", exc)
+        except (TelegramNetworkError, TelegramServerError) as exc:
+            logger.warning("انقطاع أو ضغط مؤقت في شبكة تيليجرام (سيتم إعادة المحاولة تلقائيًا): %s", exc)
             if isinstance(event, CallbackQuery):
                 try:
                     await event.answer(
-                        "🌐 بطء مؤقت في الاتصال بخوادم تيليجرام، يرجى المحاولة مرة أخرى.",
+                        "🌐 بطء لحظي في الاتصال بخوادم تيليجرام، يرجى المحاولة مرة أخرى.",
                         show_alert=False,
                     )
                 except Exception:

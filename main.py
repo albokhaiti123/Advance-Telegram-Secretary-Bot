@@ -1,9 +1,11 @@
 import asyncio
 import logging
+import socket
 import sys
 from pathlib import Path
 from aiogram import Bot, Dispatcher
 from aiogram.client.default import DefaultBotProperties
+from aiogram.client.session.aiohttp import AiohttpSession
 from aiogram.enums import ParseMode
 from aiogram.fsm.storage.memory import MemoryStorage
 
@@ -56,8 +58,16 @@ from utils.helpers import DatabaseBackupManager, SingleInstanceLock
 from utils.logger import setup_logging
 
 
+class StableIPv4Session(AiohttpSession):
+    """جلسة اتصال محسنة لخوادم VPS تجبر استخدام IPv4 وتمنع انقطاع المقابس الخاملة (Errno 104)."""
+
+    def __init__(self, timeout: float = 35.0) -> None:
+        super().__init__(timeout=timeout)
+        self._connector_init["family"] = socket.AF_INET
+        self._connector_init["keepalive_timeout"] = 15.0
+
+
 def resolve_sqlite_file_path(database_url: str) -> Path:
-    """استخراج مسار ملف SQLite الفعلي من رابط الاتصال."""
     prefix = "sqlite+aiosqlite:///"
     if database_url.startswith(prefix):
         return Path(database_url[len(prefix) :]).resolve()
@@ -74,8 +84,10 @@ async def run_application(settings: Settings) -> None:
             settings.SECRET_ENCRYPTION_KEY,
         ],
     )
+    # تقليل ضجيج إعادة الاتصال التلقائي في aiogram و telethon
+    logging.getLogger("aiogram.dispatcher").setLevel(logging.CRITICAL)
+    logging.getLogger("telethon").setLevel(logging.ERROR)
 
-    # 1. حجز قفل العملية الأحادي لمنع تشغيل نسختين متعارضتين من عميل الحساب الشخصي
     instance_lock = SingleInstanceLock(settings.PID_LOCK_FILE)
     if not instance_lock.acquire():
         logger.critical(
@@ -83,7 +95,6 @@ async def run_application(settings: Settings) -> None:
         )
         sys.exit(1)
 
-    # 2. تهيئة قاعدة البيانات وتفعيل وضع WAL
     db_manager = DatabaseManager(settings.DATABASE_URL)
     await init_database(db_manager)
 
@@ -93,13 +104,13 @@ async def run_application(settings: Settings) -> None:
         backup_dir=settings.BACKUP_DIR,
     )
 
-    # 3. تهيئة خدمات الأمان والتشفير
     secret_manager = SecretManager(settings.SECRET_ENCRYPTION_KEY)
     access_control = AccessControl(owner_id=settings.OWNER_ID, db_manager=db_manager)
 
-    # 4. تهيئة البوت ومكونات الأعمال (Telegram Business)
+    session = StableIPv4Session(timeout=35.0)
     bot = Bot(
         token=settings.BOT_TOKEN,
+        session=session,
         default=DefaultBotProperties(parse_mode=ParseMode.HTML),
     )
     notification_manager = NotificationManager(
@@ -113,7 +124,6 @@ async def run_application(settings: Settings) -> None:
     )
     business_sender = BusinessSender(bot=bot, db_manager=db_manager)
 
-    # 5. تهيئة عميل الحساب الشخصي (Telethon MTProto)
     personal_client_manager = PersonalClientManager(
         api_id=settings.TG_API_ID,
         api_hash=settings.TG_API_HASH,
@@ -140,7 +150,6 @@ async def run_application(settings: Settings) -> None:
         client_manager=personal_client_manager,
     )
 
-    # 6. تهيئة محرك السكرتير وخدمات القواعد والقوالب والاستبدال والحملات
     media_manager = MediaManager(
         db_manager=db_manager,
         media_cache_dir=settings.MEDIA_CACHE_DIR,
@@ -190,7 +199,6 @@ async def run_application(settings: Settings) -> None:
     )
     statistics_service = StatisticsService(db_manager=db_manager)
 
-    # 7. تشغيل محرك المهام المجدولة واستعادة المهام بعد إعادة التشغيل
     scheduler_manager = UnifiedSchedulerManager(
         db_manager=db_manager,
         business_sender=business_sender,
@@ -208,7 +216,6 @@ async def run_application(settings: Settings) -> None:
     recovery_stats = await recovery_service.recover_all_on_startup()
     logger.info("اكتملت استعادة المهام عند الإقلاع: %s", recovery_stats)
 
-    # 8. إعداد Dispatcher وربط Middlewares والـ Routers
     dp = Dispatcher(storage=MemoryStorage())
 
     dp.message.middleware(ErrorHandlerMiddleware(db_manager))
@@ -216,7 +223,6 @@ async def run_application(settings: Settings) -> None:
     dp.message.middleware(OwnerOnlyMiddleware(access_control))
     dp.callback_query.middleware(OwnerOnlyMiddleware(access_control))
 
-    # تمرير الاعتماديات (Dependency Injection) لجميع المعالجات
     dp["db_manager"] = db_manager
     dp["backup_manager"] = backup_manager
     dp["access_control"] = access_control
@@ -251,9 +257,10 @@ async def run_application(settings: Settings) -> None:
     )
 
     try:
-        logger.info("بدأ تشغيل نظام Telegram Secretary Bot بنجاح...")
+        logger.info("بدأ تشغيل نظام Telegram Secretary Bot بنجاح (IPv4 Stable Mode)...")
         await dp.start_polling(
             bot,
+            polling_timeout=20,
             allowed_updates=[
                 "message",
                 "callback_query",

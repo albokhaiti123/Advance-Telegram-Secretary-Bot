@@ -878,8 +878,13 @@ async def cb_launch_campaign(
     broadcast_manager: BroadcastManager,
     db_manager: DatabaseManager,
 ) -> None:
-    """إطلاق الحملة في الخلفية (Async Task) حتى لا تتجمد واجهة البوت أثناء البث."""
+    """إطلاق الحملة في الخلفية مع منع الإطلاق المزدوج إذا كانت قيد التنفيذ بالفعل."""
     camp_id = int((callback.data or "").split(":")[-1])
+    async with db_manager.session() as session:
+        camp = await session.get(BroadcastCampaign, camp_id)
+        if camp and camp.status == "running":
+            await callback.answer("⚠️ الحملة قيد التنفيذ بالفعل في الخلفية!", show_alert=True)
+            return
     run_obj = await campaign_manager.initiate_new_run(camp_id)
 
     asyncio.create_task(broadcast_manager.execute_campaign_run(camp_id, run_obj.run_id))
