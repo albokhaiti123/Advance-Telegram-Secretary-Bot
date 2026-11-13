@@ -1,3 +1,4 @@
+import asyncio
 import logging
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
@@ -49,12 +50,27 @@ class MessageProcessor:
         self.replacement_manager = (
             replacement_manager or auto_reply_service.replacement_manager
         )
+        # قفل لكل محادثة لمنع تضارب المعالجة المتزامنة (Race Condition)
+        self._processing_locks: Dict[int, asyncio.Lock] = {}
+        self._locks_guard = asyncio.Lock()
+
+    async def _get_processing_lock(self, chat_id: int) -> asyncio.Lock:
+        """إرجاع قفل asyncio مخصص لكل محادثة، مع إنشائه عند الحاجة بأمان."""
+        async with self._locks_guard:
+            if chat_id not in self._processing_locks:
+                self._processing_locks[chat_id] = asyncio.Lock()
+            return self._processing_locks[chat_id]
 
     async def handle_customer_message(self, message: Message) -> List[int]:
-        """معالجة رسالة واردة من عميل عبر Telegram Business."""
+        """معالجة رسالة واردة من عميل عبر Telegram Business — محمية بقفل مستقل لكل محادثة."""
         if not message.business_connection_id:
             return []
+        proc_lock = await self._get_processing_lock(message.chat.id)
+        async with proc_lock:
+            return await self._handle_customer_message_locked(message)
 
+    async def _handle_customer_message_locked(self, message: Message) -> List[int]:
+        """المنطق الفعلي لمعالجة الرسالة بعد الحصول على القفل الخاص بالمحادثة."""
         now = datetime.now(timezone.utc)
         async with self.db_manager.session() as session:
             master_setting = await session.scalar(

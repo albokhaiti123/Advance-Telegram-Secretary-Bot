@@ -3,7 +3,8 @@ from datetime import datetime, timezone
 from typing import Awaitable, Callable, Optional
 from aiogram import Router
 from aiogram.types import BusinessMessagesDeleted, Message
-from sqlalchemy import select, update
+from sqlalchemy import update
+from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 
 from database.database import DatabaseManager
 from database.models import Conversation, ConversationState, ManagedResponse
@@ -61,11 +62,11 @@ class BusinessUpdateProcessor:
         )
 
         async with self.db_manager.session() as session:
-            conv = await session.scalar(
-                select(Conversation).where(Conversation.chat_id == message.chat.id)
-            )
-            if conv is None:
-                conv = Conversation(
+            # UPSERT ذري لمنع تعارض الإدراج المتزامن (Race Condition)
+            # إدراج أو تحديث سجل المحادثة بشكل ذري (ON CONFLICT DO UPDATE)
+            conv_stmt = (
+                sqlite_insert(Conversation)
+                .values(
                     chat_id=message.chat.id,
                     chat_type=message.chat.type,
                     title_or_name=title_or_name,
@@ -76,19 +77,29 @@ class BusinessUpdateProcessor:
                     reply_count=0,
                     last_activity_at=now,
                 )
-                session.add(conv)
-                session.add(
-                    ConversationState(
-                        chat_id=message.chat.id,
-                        first_message_handled=False,
-                    )
+                .on_conflict_do_update(
+                    index_elements=[Conversation.chat_id],
+                    set_={
+                        "title_or_name": title_or_name,
+                        "username": username,
+                        "business_connection_id": message.business_connection_id,
+                        "message_count": Conversation.message_count + 1,
+                        "last_activity_at": now,
+                    },
                 )
-            else:
-                conv.title_or_name = title_or_name
-                conv.username = username
-                conv.business_connection_id = message.business_connection_id
-                conv.message_count = (conv.message_count or 0) + 1
-                conv.last_activity_at = now
+            )
+            await session.execute(conv_stmt)
+
+            # إدراج حالة المحادثة عند الإنشاء الأول فقط (ON CONFLICT DO NOTHING)
+            state_stmt = (
+                sqlite_insert(ConversationState)
+                .values(
+                    chat_id=message.chat.id,
+                    first_message_handled=False,
+                )
+                .on_conflict_do_nothing(index_elements=[ConversationState.chat_id])
+            )
+            await session.execute(state_stmt)
 
         if self.on_customer_message is not None:
             await self.on_customer_message(message)
